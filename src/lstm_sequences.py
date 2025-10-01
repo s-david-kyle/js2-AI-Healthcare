@@ -58,12 +58,12 @@ for col in binary_cols:
     df[col] = df[col].astype(int)
 
 # ---------------------------------------------------------------------
-# 4. Build visit-level sequences
+# 4. Build visit-level sequences (with subject IDs)
 # ---------------------------------------------------------------------
-print("🔹 Building sequences...")
+print("?? Building sequences...")
 
 SEQUENCE_LENGTH = 10
-sequences, labels = [], []
+sequences, labels, subject_ids = [], [], []
 
 for subject_id, group in df.sort_values("admittime").groupby("subject_id"):
     visit_features = group[feature_cols].values
@@ -77,14 +77,18 @@ for subject_id, group in df.sort_values("admittime").groupby("subject_id"):
         label = label_sequence[-1]
     else:
         pad_len = SEQUENCE_LENGTH - len(visit_features)
-        visit_features = np.pad(visit_features, ((pad_len, 0), (0, 0)), mode='constant')  # Pad with zeros at the beginning
+        visit_features = np.pad(
+            visit_features, ((pad_len, 0), (0, 0)), mode="constant"
+        )
         label = label_sequence[-1]
 
     sequences.append(visit_features)
     labels.append(label)
+    subject_ids.append(subject_id)   # collect subject ID
 
 X = np.stack(sequences)
 y = np.array(labels)
+subject_ids = np.array(subject_ids)
 
 # ---------------------------------------------------------------------
 # 5. Train/test split + optional oversampling
@@ -141,6 +145,11 @@ np.save(f"{out_dir}/X_train_seq.npy", X_train)
 np.save(f"{out_dir}/y_train_seq.npy", y_train)
 np.save(f"{out_dir}/X_val_seq.npy", X_val)
 np.save(f"{out_dir}/y_val_seq.npy", y_val)
+
+# Save subject IDs for the full sequence set
+np.save(f"{out_dir}/X_seq.npy", X)
+np.save(f"{out_dir}/y_seq.npy", y)
+np.save(f"{out_dir}/subject_ids_seq.npy", subject_ids)
 
 # Save feature columns for future reference
 with open(f"{out_dir}/feature_cols.txt", "w") as f:
