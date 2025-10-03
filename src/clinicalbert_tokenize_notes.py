@@ -20,21 +20,25 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------
 notes_path = "./note_sequences_per_patient.npy"
 note_sequences = np.load(notes_path, allow_pickle=True).item()
-# ---------------------------------------------------------------------
-# Filter to shared validation subjects only (if available)
-# ---------------------------------------------------------------------
-val_ids_path = f"./shared_val_ids_{args.metric_prefix}.npy"
-if os.path.exists(val_ids_path):
-    shared_val_ids = set(np.load(val_ids_path))
-    note_sequences = {sid: notes for sid, notes in note_sequences.items() if sid in shared_val_ids}
-    print(f"🔍 Restricting to {len(note_sequences)} shared validation subjects")
-else:
-    print("⚠️ No val_ids filter applied — tokenizing all subjects")
 
 # ---------------------------------------------------------------------
-# 2. Settings
+# No filtering by val/train IDs here → tokenize all subjects
 # ---------------------------------------------------------------------
-MAX_NOTES_PER_ADMISSION = 5
+print(f"ℹ️ Tokenizing all subjects: {len(note_sequences)} available")
+
+# ---------------------------------------------------------------------
+# 2. Detect SEQUENCE_LENGTH dynamically from structured sequences
+# ---------------------------------------------------------------------
+seq_file = "./X_train_transformer.npy"
+if os.path.exists(seq_file):
+    X_train = np.load(seq_file, mmap_mode="r")
+    SEQUENCE_LENGTH = X_train.shape[1]   # dimension T
+    print(f"🔄 Detected SEQUENCE_LENGTH={SEQUENCE_LENGTH} from {seq_file}")
+else:
+    SEQUENCE_LENGTH = 10  # fallback default
+    print(f"⚠️ No structured sequences found, defaulting SEQUENCE_LENGTH={SEQUENCE_LENGTH}")
+
+MAX_NOTES_PER_ADMISSION = SEQUENCE_LENGTH
 MAX_TOKENS_PER_NOTE = 256
 CACHE_DIR = "./tokenized_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -81,10 +85,11 @@ def tokenize_patient(subject_entry):
     }
 
 # ---------------------------------------------------------------------
-# 5. Parallel tokenization
+# 5. Parallel tokenization → collect aligned arrays
 # ---------------------------------------------------------------------
-tokenized_sequences = {}
+all_ids, all_inputs, all_masks = [], [], []
 skipped_subjects = []
+
 print("\n🚀 Starting parallel batch tokenization...")
 
 max_workers = min(8, os.cpu_count() or 1)
@@ -96,33 +101,37 @@ with ProcessPoolExecutor(max_workers=max_workers, initializer=init_tokenizer) as
             if tokenized is None:
                 skipped_subjects.append(subject_id)
             else:
-                tokenized_sequences[subject_id] = tokenized
-                if len(tokenized_sequences) % 1000 == 0:
-                    print(f"🧪 Tokenized {len(tokenized_sequences)} patients...")
+                all_ids.append(int(subject_id))
+                all_inputs.append(tokenized["input_ids"].numpy())     # (T, L)
+                all_masks.append(tokenized["attention_mask"].numpy()) # (T, L)
         except Exception as e:
             print(f"⚠️ Error tokenizing subject {futures[future]}: {e}")
             skipped_subjects.append(futures[future])
 
 # ---------------------------------------------------------------------
-# 6. Save
+# 6. Convert lists → NumPy arrays
 # ---------------------------------------------------------------------
-out_path = "./tokenized_clinicalbert_notes.pt"
-torch.save(tokenized_sequences, out_path, pickle_protocol=4)
+if not all_inputs:
+    raise RuntimeError("❌ No patients successfully tokenized!")
+
+all_ids = np.array(all_ids, dtype=np.int64)
+all_inputs = np.stack(all_inputs)   # (N, T, L)
+all_masks = np.stack(all_masks)     # (N, T, L)
 
 # ---------------------------------------------------------------------
-# 7. Summary Report
+# 7. Save aligned arrays (fast load at training)
 # ---------------------------------------------------------------------
+np.save(f"tokenized_input_ids_{args.metric_prefix}.npy", all_inputs)
+np.save(f"tokenized_attention_masks_{args.metric_prefix}.npy", all_masks)
+np.save(f"tokenized_subject_ids_{args.metric_prefix}.npy", all_ids)
+
+# optional marker
+with open("./tokenization_complete.txt", "w") as f:
+    f.write(f"Tokenization completed successfully.\nPatients: {len(all_ids)}\n")
+
 print("\n📋 Parallel Tokenization Summary")
 print("--------------------------------------------------")
-print(f"🧑‍⚕️ Patients tokenized: {len(tokenized_sequences)}")
-print(f"📜 Max notes per admission: {MAX_NOTES_PER_ADMISSION}")
-print(f"🔠 Max tokens per note: {MAX_TOKENS_PER_NOTE}")
-print(f"📂 Saved to: {out_path}")
-print("✅ Parallel tokenization complete!")
-
-# ---------------------------------------------------------------------
-# 8. Save completion marker
-# ---------------------------------------------------------------------
-with open("./tokenization_complete.txt", "w") as f:
-    f.write(f"Tokenization completed successfully.\nPatients: {len(tokenized_sequences)}\n")
-np.save(f"tokenized_subject_ids_{args.metric_prefix}.npy", list(tokenized_sequences.keys()))
+print(f"🧑‍⚕️ Patients tokenized: {len(all_ids)}")
+print(f"🕒 Sequence length (visits): {all_inputs.shape[1]}")
+print(f"🔠 Tokens per note: {all_inputs.shape[2]}")
+print("✅ Saved aligned .npy arrays (fast training ready)")

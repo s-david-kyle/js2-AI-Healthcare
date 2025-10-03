@@ -10,20 +10,27 @@ class ClinicalBERTLSTMDataset(Dataset):
       • list   -> list of the above (one per note); we stack along time axis
     """
 
-    def __init__(self, X_structured, y, tokenized_notes):
-        # normalise tokenized_notes to list so slicing works
-        if isinstance(tokenized_notes, dict):
-            tokenized_notes = list(tokenized_notes.values())
-        tokenized_notes = list(tokenized_notes)
+    def __init__(self, X_structured, y, tokenized_notes, masks):
+            if isinstance(tokenized_notes, dict):
+                tokenized_notes = list(tokenized_notes.values())
+            tokenized_notes = list(tokenized_notes)
 
-        # align lengths
-        N = min(len(X_structured), len(y), len(tokenized_notes))
-        self.X_structured = X_structured[:N]
-        self.y            = y[:N]
-        self.notes        = tokenized_notes[:N]
+            N = min(len(X_structured), len(y), len(tokenized_notes), len(masks))
+            self.X_structured = X_structured[:N]
+            self.y = y[:N]
+            self.notes = tokenized_notes[:N]
+            self.masks = masks[:N]
 
     def __len__(self):
         return len(self.y)
+
+    def __getitem__(self, idx):
+        struct_seq = torch.tensor(self.X_structured[idx], dtype=torch.float32)
+        label = torch.tensor(self.y[idx], dtype=torch.long)
+        visit_mask = torch.tensor(self.masks[idx], dtype=torch.float32)  # (T,)
+
+        input_ids, attention_mask = self._unpack_note(self.notes[idx])
+        return input_ids, attention_mask, struct_seq, visit_mask, label
 
     # ------------------------------------------------------------
     # helper to unpack a single note item to (ids, mask) tensors

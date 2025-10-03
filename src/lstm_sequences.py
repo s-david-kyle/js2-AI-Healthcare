@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.utils import resample
 from collections import Counter
 
@@ -12,6 +11,8 @@ BASE_SEED = 42
 OFFSET = int(os.getenv("SEED_OFFSET", 0))
 SEED = BASE_SEED + OFFSET
 np.random.seed(SEED)
+
+METRIC_PREFIX = os.getenv("METRIC_PREFIX", "iter1")
 
 # ---------------------------------------------------------------------
 # 1. Load boosted structured + note features
@@ -43,24 +44,21 @@ label_col = "multiclass_label"
 # ---------------------------------------------------------------------
 print("🔹 Preprocessing...")
 
-# Handle missing values
 df[feature_cols] = df[feature_cols].fillna(0)
 df = df.dropna(subset=[label_col])
 df[label_col] = df[label_col].astype(int)
 
-# Encode categorical variables
 df["gender"] = df["gender"].map({"M": 1, "F": 0})
 df["insurance_group"] = df["insurance_group"].astype("category").cat.codes
 df["admission_type"] = df["admission_type"].astype("category").cat.codes
 
-binary_cols = ["was_in_icu", "seen_by_psych", "polypharmacy_flag"]
-for col in binary_cols:
+for col in ["was_in_icu", "seen_by_psych", "polypharmacy_flag"]:
     df[col] = df[col].astype(int)
 
 # ---------------------------------------------------------------------
 # 4. Build visit-level sequences (with subject IDs)
 # ---------------------------------------------------------------------
-print("?? Building sequences...")
+print("🔹 Building sequences...")
 
 SEQUENCE_LENGTH = 10
 sequences, labels, subject_ids = [], [], []
@@ -84,20 +82,22 @@ for subject_id, group in df.sort_values("admittime").groupby("subject_id"):
 
     sequences.append(visit_features)
     labels.append(label)
-    subject_ids.append(subject_id)   # collect subject ID
+    subject_ids.append(subject_id)
 
 X = np.stack(sequences)
 y = np.array(labels)
 subject_ids = np.array(subject_ids)
 
 # ---------------------------------------------------------------------
-# 5. Train/test split + optional oversampling
+# 5. Shared validation split
 # ---------------------------------------------------------------------
-print("🔹 Splitting train/val...")
+print("🔹 Splitting train/val with shared IDs...")
+val_ids = np.load(f"shared_val_ids_{METRIC_PREFIX}.npy")
 
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, stratify=y, test_size=0.2, random_state=SEED
-)
+is_val = np.isin(subject_ids, val_ids)
+X_train, X_val = X[~is_val], X[is_val]
+y_train, y_val = y[~is_val], y[is_val]
+subj_train, subj_val = subject_ids[~is_val], subject_ids[is_val]
 
 # Diagnostic: check class coverage
 def check_class_coverage(y, label):
@@ -108,11 +108,8 @@ def check_class_coverage(y, label):
         print(f"⚠️ WARNING: {label} missing classes: {missing}")
     return missing
 
-missing = check_class_coverage(y_train, "Train")
+check_class_coverage(y_train, "Train")
 check_class_coverage(y_val, "Validation")
-
-if missing:
-    raise ValueError(f"🚨 Training data missing class(es): {missing}")
 
 # Optional oversampling of co-morbid (class 2)
 OVERSAMPLE_TARGET = int(os.getenv("OVERSAMPLE_TARGET", 100))
@@ -125,12 +122,10 @@ if train_counts[minority_class] < OVERSAMPLE_TARGET:
     n_samples = OVERSAMPLE_TARGET - len(y_min)
 
     X_upsampled, y_upsampled = resample(
-        X_min, y_min,
-        replace=True, n_samples=n_samples, random_state=SEED
+        X_min, y_min, replace=True, n_samples=n_samples, random_state=SEED
     )
     X_train = np.concatenate([X_train, X_upsampled])
     y_train = np.concatenate([y_train, y_upsampled])
-
     print("✅ Oversampling complete.")
     check_class_coverage(y_train, "Train (post-oversample)")
 
@@ -145,18 +140,20 @@ np.save(f"{out_dir}/X_train_seq.npy", X_train)
 np.save(f"{out_dir}/y_train_seq.npy", y_train)
 np.save(f"{out_dir}/X_val_seq.npy", X_val)
 np.save(f"{out_dir}/y_val_seq.npy", y_val)
+np.save(f"{out_dir}/subject_ids_train_seq.npy", subj_train)
+np.save(f"{out_dir}/subject_ids_val_seq.npy", subj_val)
 
-# Save subject IDs for the full sequence set
+# Save full set
 np.save(f"{out_dir}/X_seq.npy", X)
 np.save(f"{out_dir}/y_seq.npy", y)
 np.save(f"{out_dir}/subject_ids_seq.npy", subject_ids)
 
-# Save feature columns for future reference
+# Save feature columns
 with open(f"{out_dir}/feature_cols.txt", "w") as f:
     for col in feature_cols:
         f.write(f"{col}\n")
 
-print("✅ Saved LSTM-ready sequences with boosted structured + note features.")
+print("✅ Saved sequence arrays aligned with shared validation IDs.")
 
 # ---------------------------------------------------------------------
 # 7. Summary Report
@@ -166,4 +163,4 @@ print(f"Training Set: {X_train.shape}, Validation Set: {X_val.shape}")
 print(f"Feature Dimensions: {X_train.shape[-1]}")
 print(f"Class Distribution (Train):", dict(Counter(y_train)))
 print(f"Class Distribution (Validation):", dict(Counter(y_val)))
-print(f"Seed Used: {SEED}")
+print(f"Seed Used: {SEED}, Metric Prefix: {METRIC_PREFIX}")

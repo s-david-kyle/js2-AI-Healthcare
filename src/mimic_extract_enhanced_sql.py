@@ -3,7 +3,6 @@ import json
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
-from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -60,27 +59,47 @@ def matches_any(code, code_set):
 
 
 # ---------------------------------------------------------------------
-# 3. Load Tables (from CSVs instead of database)
+# 3. Load Tables
 # ---------------------------------------------------------------------
-print("Loading tables from CSVs...")
+print("Loading tables...")
 
-def load_csv(file, usecols=None):
-    """Helper: load CSV, lowercase all column names, and subset if needed."""
-    df = pd.read_csv(file)
-    df.columns = df.columns.str.lower()
-    if usecols:
-        df = df[usecols]
-    return df
+# ---------------------------------------------------------------------
+# 3. Load Tables (schema-qualified)
+# ---------------------------------------------------------------------
+print("Loading tables...")
 
-diag_df = load_csv("DIAGNOSES_ICD.csv", ["subject_id", "hadm_id", "icd9_code"]).dropna(subset=["icd9_code"])
-adm_df = load_csv("ADMISSIONS.csv", ["subject_id", "hadm_id", "admittime", "dischtime", "insurance", "admission_type"])
-pat_df = load_csv("PATIENTS.csv", ["subject_id", "gender", "dob", "dod", "expire_flag"])
-transfers_df = load_csv("TRANSFERS.csv", ["subject_id", "hadm_id", "icustay_id", "intime", "outtime", "curr_careunit"])
-services_df = load_csv("SERVICES.csv", ["subject_id", "hadm_id", "curr_service"])
-prescriptions_df = load_csv("PRESCRIPTIONS.csv", ["subject_id", "hadm_id", "drug"])
+diag_df = pd.read_sql(f"""
+    SELECT subject_id, hadm_id, icd9_code
+    FROM {SCHEMA}.diagnoses_icd
+    WHERE icd9_code IS NOT NULL;
+""", engine)
 
-print("All CSVs loaded.")
+adm_df = pd.read_sql(f"""
+    SELECT subject_id, hadm_id, admittime, dischtime, insurance, admission_type
+    FROM {SCHEMA}.admissions;
+""", engine)
 
+pat_df = pd.read_sql(f"""
+    SELECT subject_id, gender, dob, dod, expire_flag
+    FROM {SCHEMA}.patients;
+""", engine)
+
+transfers_df = pd.read_sql(f"""
+    SELECT subject_id, hadm_id, icustay_id, intime, outtime, curr_careunit
+    FROM {SCHEMA}.transfers;
+""", engine)
+
+services_df = pd.read_sql(f"""
+    SELECT subject_id, hadm_id, curr_service
+    FROM {SCHEMA}.services;
+""", engine)
+
+prescriptions_df = pd.read_sql(f"""
+    SELECT subject_id, hadm_id, drug
+    FROM {SCHEMA}.prescriptions;
+""", engine)
+
+print("All tables loaded.")
 
 print(f"📊 diagnoses_icd rows: {len(diag_df)}")
 print(f"📊 admissions rows: {len(adm_df)}")
@@ -88,7 +107,6 @@ print(f"📊 patients rows: {len(pat_df)}")
 print(f"📊 transfers rows: {len(transfers_df)}")
 print(f"📊 services rows: {len(services_df)}")
 print(f"📊 prescriptions rows: {len(prescriptions_df)}")
-print("\n🔍 Sample ICD-9 codes from database:", diag_df['icd9_code'].head(10).tolist())
 print("Checking depression example:")
 print([c for c in diag_df['icd9_code'].unique() if str(c).startswith("2962")][:10])
 

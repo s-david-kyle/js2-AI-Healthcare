@@ -64,15 +64,17 @@ def collate_fn(batch):
     input_ids = [item[0] for item in batch]
     attention_masks = [item[1] for item in batch]
     structured = [item[2] for item in batch]
-    labels = [item[3] for item in batch]
+    visit_masks = [item[3] for item in batch]
+    labels = [item[4] for item in batch]
 
-    # Pad along time dimension (T)
-    padded_input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True)
-    padded_attention = torch.nn.utils.rnn.pad_sequence(attention_masks, batch_first=True)
-    padded_structured = torch.nn.utils.rnn.pad_sequence(structured, batch_first=True)
-    labels = torch.tensor(labels, dtype=torch.long)
+    padded_input_ids = pad_sequence(input_ids, batch_first=True)
+    padded_attention = pad_sequence(attention_masks, batch_first=True)
+    padded_structured = pad_sequence(structured, batch_first=True)
+    padded_visit_masks = pad_sequence(visit_masks, batch_first=True)  # [B, T]
 
-    return padded_input_ids, padded_attention, padded_structured, labels
+    labels = torch.tensor([int(l) for l in labels], dtype=torch.long)
+
+    return padded_input_ids, padded_attention, padded_structured, padded_visit_masks, labels
 
 
 BASE = "./"

@@ -1,362 +1,272 @@
-import os
-import csv
+# clinicalbert_training.py
+import os, csv, gc
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
+from clinicalbert_dataset import (
+    ClinicalBERTFastDatasetWithIDs, collate_fn,
+    ClinicalBERTPrecomputedDataset, collate_precomputed
+)
 from transformers import AutoModel, get_cosine_schedule_with_warmup
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.amp import GradScaler, autocast
 from resource_logger import ResourceLogger
-from clinicalbert_dataset import ClinicalBERTDataset
-from clinicalbert_model import ClinicalBERT_Transformer  # Updated model filename
 from tqdm import tqdm
 import argparse
-import gc
-import pynvml
 
+# ----------------------------- Args / Seeds -----------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--metric_prefix", type=str, default=None)
 parser.add_argument("--low_mem_mode", action="store_true", help="Enable low memory mode")
+parser.add_argument("--precomputed", action="store_true", help="Use precomputed embeddings if available")
+parser.add_argument("--precomputed_path", type=str, default=None, help="Path to precomputed npz file")
 args = parser.parse_args()
 
 METRIC_PREFIX = args.metric_prefix or os.getenv("METRIC_PREFIX", "iter1")
+PRECOMP_DEFAULT = f"./precomputed_bert_cls_{METRIC_PREFIX}.npz"
+PRECOMP_PATH = args.precomputed_path or PRECOMP_DEFAULT
+USE_PRECOMPUTED = args.precomputed or os.path.exists(PRECOMP_PATH)
+print(f"🧩 Precomputed mode: {USE_PRECOMPUTED} | path: {PRECOMP_PATH if USE_PRECOMPUTED else 'N/A'}")
 
 BASE_SEED = 42
 OFFSET = int(os.getenv("SEED_OFFSET", 0))
 SEED = BASE_SEED + OFFSET
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+np.random.seed(SEED); torch.manual_seed(SEED)
+MAX_VISITS = 10
 
-def collate_fn(batch):
-    """
-    Pads tokenized note sequences and structured features for batching.
-
-    Each batch item is:
-      - input_ids:      [T, L]
-      - attention_mask: [T, L]
-      - structured:     [T, F]
-      - label:          scalar
-
-    Returns:
-      - input_ids:      [B, T, L]
-      - attention_mask: [B, T, L]
-      - structured:     [B, T, F]
-      - labels:         [B]
-    """
-    input_ids = [item[0] for item in batch]
-    attention_masks = [item[1] for item in batch]
-    structured = [item[2] for item in batch]
-    labels = [item[3] for item in batch]
-
-    padded_input_ids = pad_sequence(input_ids, batch_first=True)  # pads T dimension
-    padded_attention = pad_sequence(attention_masks, batch_first=True)
-    padded_structured = pad_sequence(structured, batch_first=True)
-
-    # Ensure labels are int tensors
-    labels = torch.tensor([int(l) if not torch.is_tensor(l) else l.item() for l in labels], dtype=torch.long)
-
-    return padded_input_ids, padded_attention, padded_structured, labels
-
-# Loading your data (replace with actual loading code)
+# ----------------------------- Load Data --------------------------------
 BASE = "./"
-shared_val_ids = np.load(f"{BASE}/shared_val_ids_{METRIC_PREFIX}.npy", allow_pickle=True)
-X_all = np.load(f"{BASE}/X_seq.npy")
-y_all = np.load(f"{BASE}/y_seq.npy")
-subject_ids = np.load(f"{BASE}/subject_ids_seq.npy")
-val_subject_ids = subject_ids[np.isin(subject_ids, shared_val_ids)]
-
-print("Number of shared_val_ids:", len(shared_val_ids))
-
-mask = np.isin(subject_ids, shared_val_ids)
-X_train, X_val = X_all[~mask], X_all[mask]
-y_train, y_val = y_all[~mask], y_all[mask]
-notes = torch.load(f"{BASE}/tokenized_clinicalbert_notes.pt", weights_only=False)
-
-print(f"  Validation samples: {len(y_val)}")
-
-val_subject_ids = subject_ids[np.isin(subject_ids, shared_val_ids)]
-notes_dict = {int(k): v for k, v in notes.items()}
-valid_ids = [sid for sid in val_subject_ids if sid in notes_dict]
-
-mask = np.isin(val_subject_ids, valid_ids)
-X_val = X_val[mask]
-y_val = y_val[mask]
-val_subject_ids = val_subject_ids[mask]
-notes = [notes_dict[sid] for sid in val_subject_ids]
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark = True
 
-print(f"\n?? Dataset Split Summary:")
-print(f"  Training samples:   {len(y_train)}")
-print(f"  Validation samples: {len(y_val)}")
+# Structured sequences
+X_train = np.load(f"{BASE}/X_train_transformer.npy")
+y_train = np.load(f"{BASE}/y_train_transformer.npy")
+m_train = np.load(f"{BASE}/mask_train_transformer.npy")
+sid_train = np.load(f"{BASE}/subject_ids_train_transformer.npy")
+X_val   = np.load(f"{BASE}/X_val_transformer.npy")
+y_val   = np.load(f"{BASE}/y_val_transformer.npy")
+m_val   = np.load(f"{BASE}/mask_val_transformer.npy")
+sid_val = np.load(f"{BASE}/subject_ids_val_transformer.npy")
 
-# Class weights for imbalance
-class_counts = np.bincount(y_train)
-class_weights = 1.0 / class_counts
-norm_weights = class_weights / class_weights.sum()
-weight_tensor = torch.tensor(norm_weights, dtype=torch.float32).to(device)
+# Notes or embeddings
+if USE_PRECOMPUTED:
+    pre = np.load(PRECOMP_PATH)
+    BERT_EMB_ALL = pre["embeddings"]
+    sid_notes = pre["subject_ids"]
+    print(f"📥 Loaded precomputed embeddings: {BERT_EMB_ALL.shape}")
+else:
+    X_notes = np.load(f"{BASE}/tokenized_input_ids_{METRIC_PREFIX}.npy")
+    M_notes = np.load(f"{BASE}/tokenized_attention_masks_{METRIC_PREFIX}.npy")
+    sid_notes = np.load(f"{BASE}/tokenized_subject_ids_{METRIC_PREFIX}.npy")
+    TRUNC_TOKENS = int(os.getenv("TRUNC_TOKENS", 128))
+    if X_notes.shape[-1] > TRUNC_TOKENS:
+        X_notes = X_notes[:, :, :TRUNC_TOKENS]
+        M_notes = M_notes[:, :, :TRUNC_TOKENS]
+        print(f"✂️ Truncated note sequences to {TRUNC_TOKENS} tokens per visit.")
 
-train_ds = ClinicalBERTDataset(X_train, y_train, notes)
-val_ds = ClinicalBERTDataset(X_val, y_val, notes)
+# Align
+sid_to_idx = {int(s): i for i, s in enumerate(sid_notes)}
+def align_split(X, y, m, sids):
+    keep_mask = np.isin(sids, sid_notes)
+    sids_keep = sids[keep_mask]
+    X, y, m = X[keep_mask], y[keep_mask], m[keep_mask]
+    note_idx = [sid_to_idx[int(s)] for s in sids_keep]
+    if USE_PRECOMPUTED:
+        emb = BERT_EMB_ALL[note_idx]
+        return X, y, m, sids_keep, emb, None
+    else:
+        return X, y, m, sids_keep, X_notes[note_idx], M_notes[note_idx]
 
-BATCH_SIZE = 16 if (args.low_mem_mode or os.getenv("LOW_MEM_MODE") == "1") else 32
-NUM_WORKERS = 2 if (args.low_mem_mode or os.getenv("LOW_MEM_MODE") == "1") else 4
-PIN_MEMORY = not (args.low_mem_mode or os.getenv("LOW_MEM_MODE") == "1")
+X_train, y_train, m_train, sid_train, A_train, B_train = align_split(X_train, y_train, m_train, sid_train)
+X_val,   y_val,   m_val,   sid_val,   A_val,   B_val   = align_split(X_val,   y_val,   m_val,   sid_val)
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                          collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+if USE_PRECOMPUTED:
+    print(f"📊 Train embs={A_train.shape}, Val embs={A_val.shape}")
+else:
+    print(f"📊 Train notes={A_train.shape}, Val notes={A_val.shape}")
 
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
-
-bert = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
-model = ClinicalBERT_Transformer(bert_model=bert,
-                                 structured_input_dim=X_train.shape[2],
-                                 hidden_dim=128,
-                                 nhead=8,
-                                 num_layers=2,
-                                 dropout=0.4)
-model.to(device)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
-
-num_epochs = 20
-num_training_steps = len(train_loader) * num_epochs
-num_warmup_steps = int(0.1 * num_training_steps)
-
-scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-
-#scaler = torch.cuda.amp.GradScaler(device='cuda')
-scaler = GradScaler()
-
-#criterion = nn.BCEWithLogitsLoss(pos_weight=weight_tensor[1])  # binary classification
+# ----------------------------- Class Weights ----------------------------
+class_counts = np.bincount(y_train.astype(int), minlength=3)
+inv_freq = np.where(class_counts > 0, (len(y_train) / (3.0 * class_counts)), 0.0)
+weight_tensor = torch.tensor(inv_freq, dtype=torch.float32, device=device)
 criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
+# ----------------------------- DataLoaders ------------------------------
+BATCH_SIZE  = 16 if (args.low_mem_mode or os.getenv("LOW_MEM_MODE") == "1") else 32
+NUM_WORKERS = 2 if (args.low_mem_mode or os.getenv("LOW_MEM_MODE") == "1") else min(8, os.cpu_count() or 8)
+
+if USE_PRECOMPUTED:
+    train_ds = ClinicalBERTPrecomputedDataset(X_train, y_train, A_train, m_train, sid_train, max_visits=MAX_VISITS)
+    val_ds   = ClinicalBERTPrecomputedDataset(X_val,   y_val,   A_val,   m_val,   sid_val,   max_visits=MAX_VISITS)
+    _collate = collate_precomputed
+else:
+    train_ds = ClinicalBERTFastDatasetWithIDs(X_train, y_train, A_train, B_train, m_train, sid_train, max_visits=MAX_VISITS)
+    val_ds   = ClinicalBERTFastDatasetWithIDs(X_val,   y_val,   A_val,   B_val,   m_val,   sid_val,   max_visits=MAX_VISITS)
+    _collate = collate_fn
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=_collate,
+                          num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=(NUM_WORKERS > 0))
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=_collate,
+                          num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=(NUM_WORKERS > 0))
+
+# ----------------------------- Models ----------------------------------
+from clinicalbert_model import ClinicalBERT_Transformer
+
+class EmbeddingVisitTransformer(nn.Module):
+    def __init__(self, structured_input_dim, hidden_dim=128, nhead=8, num_layers=2, dropout=0.4):
+        super().__init__()
+        self.bert_proj = nn.Linear(768, hidden_dim)
+        self.struct_proj = nn.Linear(structured_input_dim, hidden_dim) if structured_input_dim is not None else None
+        self.fusion_proj = nn.Linear(hidden_dim * 2, hidden_dim) if self.struct_proj is not None else None
+        enc_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.classifier = nn.Sequential(nn.Linear(hidden_dim, 64), nn.GELU(), nn.Dropout(dropout), nn.Linear(64, 3))
+    def forward(self, bert_embs, structured_seq=None, visit_mask=None):
+        x = self.bert_proj(bert_embs)
+        if self.struct_proj is not None and structured_seq is not None:
+            s = self.struct_proj(structured_seq)
+            x = self.fusion_proj(torch.cat([x, s], dim=-1))
+        x = self.encoder(x)
+        if visit_mask is not None:
+            m = visit_mask.unsqueeze(-1).float()
+            pooled = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-6)
+        else: pooled = x.mean(dim=1)
+        return self.classifier(pooled)
+
+if USE_PRECOMPUTED:
+    model = EmbeddingVisitTransformer(structured_input_dim=X_train.shape[2]).to(device)
+    print("🧠 Using EmbeddingVisitTransformer (no BERT in training).")
+else:
+    bert = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+    for p in bert.parameters(): p.requires_grad = False
+    for p in bert.encoder.layer[-2:].parameters(): p.requires_grad = True
+    model = ClinicalBERT_Transformer(bert_model=bert, structured_input_dim=X_train.shape[2],
+                                     hidden_dim=128, nhead=8, num_layers=2, dropout=0.4).to(device)
+    print("🧊 Using ClinicalBERT_Transformer (fine-tuning last 2 layers).")
+
+# ----------------------------- Optimizer/Training -----------------------
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
+num_epochs = 20
+num_training_steps = max(1, len(train_loader)) * num_epochs
+num_warmup_steps = int(0.1 * num_training_steps)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+scaler = GradScaler(enabled=torch.cuda.is_available())
 
 BEST_PATH = f"{BASE}/clinicalbert_transformer_model_{METRIC_PREFIX}.pt"
 METRIC_CSV = f"{BASE}/clinicalbert_transformer_metrics_{METRIC_PREFIX}.csv"
+best_val_loss, patience, counter = float('inf'), 5, 0
 
-best_val_loss = float('inf')
-patience = 5
-counter = 0
-
+# ----------------------------- Training Loop ----------------------------
 try:
     with ResourceLogger(tag="clinicalbert_transformer"):
         for epoch in range(num_epochs):
-            model.train()
-            train_loss = 0
-
-            for input_ids, attention_mask, struct_seq, labels in tqdm(train_loader, desc=f"Epoch {epoch+1} Training"):
-                input_ids = input_ids.to(device)
-                attention_mask = attention_mask.to(device)
-                struct_seq = struct_seq.to(device)
-                labels = labels.long().to(device)
-
-                optimizer.zero_grad()
-                with autocast(device_type="cuda"):
-                    logits = model(input_ids, attention_mask, struct_seq)
-                    loss = criterion(logits, labels)
+            model.train(); train_loss = 0.0
+            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} Training"):
+                optimizer.zero_grad(set_to_none=True)
+                if USE_PRECOMPUTED:
+                    bert_embs, struct_seq, visit_mask, labels, _ = batch
+                    bert_embs, struct_seq, visit_mask, labels = (
+                        bert_embs.to(device), struct_seq.to(device), visit_mask.float().to(device), labels.to(device)
+                    )
+                    with autocast(device_type="cuda", enabled=torch.cuda.is_available()):
+                        logits = model(bert_embs, struct_seq, visit_mask)
+                        loss = criterion(logits, labels)
+                else:
+                    ids, amask, struct_seq, visit_mask, labels, _ = batch
+                    ids, amask, struct_seq, visit_mask, labels = (
+                        ids.to(device), amask.to(device), struct_seq.to(device), visit_mask.float().to(device), labels.to(device)
+                    )
+                    with autocast(device_type="cuda", enabled=torch.cuda.is_available()):
+                        logits = model(ids, amask, struct_seq, visit_mask)
+                        loss = criterion(logits, labels)
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-
+                scaler.step(optimizer); scaler.update(); scheduler.step()
                 train_loss += loss.item()
-
-            train_loss /= len(train_loader)
+            train_loss /= max(1, len(train_loader))
             print(f"Epoch {epoch+1} Train Loss: {train_loss:.4f}")
 
-            model.eval()
-            val_loss = 0
-            preds = []
-            trues = []
-
+            # Validation
+            model.eval(); val_loss, preds, trues, subj_out = 0.0, [], [], []
             with torch.no_grad():
-                for input_ids, attention_mask, struct_seq, labels in tqdm(val_loader, desc=f"Epoch {epoch+1} Validation"):
-                    input_ids = input_ids.to(device)
-                    attention_mask = attention_mask.to(device)
-                    struct_seq = struct_seq.to(device)
-                    labels = labels.long().to(device)
-
-                    logits = model(input_ids, attention_mask, struct_seq)
-                    loss = criterion(logits, labels)
-                    val_loss += loss.item()
-
-                    probs = torch.softmax(logits, dim=1).cpu().numpy()  # (B, 3)
-                    batch_preds = np.argmax(probs, axis=1)
-                    #probs = torch.sigmoid(logits).cpu().numpy()
-                    #batch_preds = (probs >= 0.5).astype(int)
-                    preds.extend(batch_preds)
-                    trues.extend(labels.cpu().numpy().astype(int))
-
-            val_loss /= len(val_loader)
+                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1} Validation"):
+                    if USE_PRECOMPUTED:
+                        bert_embs, struct_seq, visit_mask, labels, subj_ids = batch
+                        bert_embs, struct_seq, visit_mask, labels = (
+                            bert_embs.to(device), struct_seq.to(device), visit_mask.float().to(device), labels.to(device)
+                        )
+                        logits = model(bert_embs, struct_seq, visit_mask)
+                    else:
+                        ids, amask, struct_seq, visit_mask, labels, subj_ids = batch
+                        ids, amask, struct_seq, visit_mask, labels = (
+                            ids.to(device), amask.to(device), struct_seq.to(device), visit_mask.float().to(device), labels.to(device)
+                        )
+                        logits = model(ids, amask, struct_seq, visit_mask)
+                    loss = criterion(logits, labels); val_loss += loss.item()
+                    probs = torch.softmax(logits, dim=1).cpu().numpy()
+                    preds.extend(np.argmax(probs, axis=1))
+                    trues.extend(labels.cpu().numpy())
+                    subj_out.extend(subj_ids.cpu().numpy())
+            val_loss /= max(1, len(val_loader))
             print(f"Epoch {epoch+1} Val Loss: {val_loss:.4f}")
-
             if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                counter = 0
-                torch.save(model.state_dict(), BEST_PATH)
-                print(f"  Saved best model at epoch {epoch+1}")
+                best_val_loss, counter = val_loss, 0
+                torch.save(model.state_dict(), BEST_PATH); print(f"  ✅ Saved best model at epoch {epoch+1}")
             else:
                 counter += 1
-                if counter >= patience:
-                    print("Early stopping triggered.")
-                    break
-
+                if counter >= patience: print("⏹️ Early stopping."); break
 except Exception as e:
-    print("bert_emb:", bert_emb.shape)
-    print("structured_seq:", structured_seq.shape)
     print(f"Training crashed: {e}")
 
-# ---------------------------------------------------------------------
-# Save prediction probabilities for stacking
-# ---------------------------------------------------------------------
-finally:
-    print(f"\n?? Saving predicted probabilities for {METRIC_PREFIX}...")
-
-    model = ClinicalBERT_Transformer(bert_model=bert,
-                                     structured_input_dim=X_train.shape[2],
-                                     hidden_dim=128,
-                                     nhead=8,
-                                     num_layers=2,
-                                     dropout=0.4).to(device)
-
-    model.load_state_dict(torch.load(BEST_PATH))
-    model.eval()
-
-    probs, preds, trues = [], [], []
-
+# ----------------------------- Save Metrics -----------------------------
+print(f"\n💾 Saving predicted probabilities for {METRIC_PREFIX}...")
+if os.path.exists(BEST_PATH):
+    model.load_state_dict(torch.load(BEST_PATH, map_location=device)); model.eval()
+    probs, preds, trues, subj_out = [], [], [], []
     with torch.no_grad():
-        for ids, mask, struct, lbl in tqdm(val_loader, desc="Saving Probs"):
-            ids = ids.to(device)
-            mask = mask.to(device)
-            struct = struct.to(device)
-            lbl = lbl.to(device).float()
+        for batch in tqdm(val_loader, desc="Saving Probs"):
+            if USE_PRECOMPUTED:
+                bert_embs, struct_seq, visit_mask, labels, subj_ids = batch
+                bert_embs, struct_seq, visit_mask, labels = (
+                    bert_embs.to(device), struct_seq.to(device), visit_mask.float().to(device), labels.to(device)
+                )
+                logits = model(bert_embs, struct_seq, visit_mask)
+            else:
+                ids, amask, struct_seq, visit_mask, labels, subj_ids = batch
+                ids, amask, struct_seq, visit_mask, labels = (
+                    ids.to(device), amask.to(device), struct_seq.to(device), visit_mask.float().to(device), labels.to(device)
+                )
+                logits = model(ids, amask, struct_seq, visit_mask)
+            p = torch.softmax(logits, dim=1).cpu().numpy()
+            probs.extend(p); preds.extend(np.argmax(p, axis=1))
+            trues.extend(labels.cpu().numpy()); subj_out.extend(subj_ids.cpu().numpy())
+    probs, preds, trues, subj_out = np.array(probs), np.array(preds), np.array(trues), np.array(subj_out)
+    all_classes = [0,1,2]
+    y_bin = label_binarize(trues, classes=all_classes)
+    macro_auc = roc_auc_score(y_bin, probs, average="macro", multi_class="ovr")
+    micro_auc = roc_auc_score(y_bin, probs, average="micro", multi_class="ovr")
+    print(f"ROC-AUC (macro): {macro_auc:.4f} | (micro): {micro_auc:.4f}")
+    report = classification_report(trues, preds, labels=all_classes, zero_division=0, output_dict=True)
+    with open(METRIC_CSV,"w",newline="") as f:
+        w=csv.writer(f); w.writerow(["Class","Precision","Recall","F1-score"])
+        for cls in all_classes:
+            row=report.get(str(cls),{"precision":0,"recall":0,"f1-score":0})
+            w.writerow([cls,f"{row['precision']:.4f}",f"{row['recall']:.4f}",f"{row['f1-score']:.4f}"])
+        w.writerow(["Accuracy",f"{report.get('accuracy',0):.4f}","",""])
+        w.writerow(["MacroAUC",f"{macro_auc:.4f}","",""]); w.writerow(["MicroAUC",f"{micro_auc:.4f}","",""])
+    cm = confusion_matrix(trues, preds, labels=all_classes)
+    plt.figure(figsize=(6,5)); sns.heatmap(cm,annot=True,fmt="d",cmap="Blues",
+        xticklabels=all_classes,yticklabels=all_classes)
+    plt.xlabel("Predicted"); plt.ylabel("True"); plt.title("Confusion Matrix")
+    plt.tight_layout(); plt.savefig(f"{BASE}/clinicalbert_confusion_{METRIC_PREFIX}.png"); plt.close()
+    np.savez_compressed(f"{BASE}/clinicalbert_transformer_probs_{METRIC_PREFIX}.npz",
+        probs=probs, y_true=trues.astype(np.int64), subject_ids=subj_out.astype(np.int64))
+    print(f"📦 Saved outputs → clinicalbert_transformer_probs_{METRIC_PREFIX}.npz")
+else:
+    print(f"❌ No saved model found at {BEST_PATH}")
 
-            logits = model(ids, mask, struct)  # logits: [B, C]
-            prob = torch.softmax(logits, dim=1).cpu().numpy()  # [B, C]
-            pred = np.argmax(prob, axis=1)  # [B]
-            true = lbl.cpu().numpy()        # [B]
-            
-            probs.extend(prob)
-            preds.extend(pred)
-            trues.extend(true)
-
-    del model
-    torch.cuda.empty_cache()
-    gc.collect()
-    print("?? Cleaned up model and freed GPU memory.")
-
-# ?? Reload model from checkpoint (optional redundancy)
-bert = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
-model = ClinicalBERT_Transformer(bert_model=bert,
-                                 structured_input_dim=X_train.shape[2],
-                                 hidden_dim=128,
-                                 nhead=8,
-                                 num_layers=2,
-                                 dropout=0.4).to(device)
-model.load_state_dict(torch.load(BEST_PATH))
-model.eval()
-
-# Convert to NumPy arrays
-probs_np = np.array(probs)
-y_val_np = np.array(y_val)
-subj_out = val_subject_ids
-
-# ?? Sanity checks
-print(f"? probs shape:      {probs_np.shape}")
-print(f"? y_val shape:      {y_val_np.shape}")
-print(f"? subject_ids shape:{subj_out.shape}")
-assert probs_np.shape[0] == y_val_np.shape[0] == subj_out.shape[0], (
-    f"? Mismatch in number of samples: probs {probs_np.shape[0]}, "
-    f"labels {y_val_np.shape[0]}, subject_ids {subj_out.shape[0]}"
-)
-
-# ---------------------------------------------------------------------
-# Save metrics
-# ---------------------------------------------------------------------
-from sklearn.utils.multiclass import unique_labels
-
-# Explicitly define your full set of labels
-all_classes = [0, 1, 2]
-
-# Generate classification report
-report = classification_report(
-    trues, preds,
-    labels=all_classes,
-    zero_division=0,
-    output_dict=True
-)
-
-# Save to CSV
-with open(METRIC_CSV, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["Class", "Precision", "Recall", "F1-score"])
-    
-    for cls in all_classes:
-        cls_str = str(cls)
-        if cls_str in report:
-            row = report[cls_str]
-            writer.writerow([
-                cls_str,
-                f"{row['precision']:.4f}",
-                f"{row['recall']:.4f}",
-                f"{row['f1-score']:.4f}"
-            ])
-        else:
-            # Class was missing in predictions or ground truth
-            writer.writerow([cls_str, "0.0000", "0.0000", "0.0000"])
-
-# Print full report to console
-print(classification_report(trues, preds, labels=all_classes, zero_division=0))
-
-'''
-acc = accuracy_score(trues, preds)
-report = classification_report(trues, preds, zero_division=0, output_dict=True)
-
-with open(METRIC_CSV, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["Class", "Precision", "Recall", "F1-score"])
-    for cls in sorted(report.keys()):
-        if cls in ["accuracy"]:
-            continue
-        row = report[cls]
-        writer.writerow([cls, f"{row['precision']:.4f}", f"{row['recall']:.4f}", f"{row['f1-score']:.4f}"])
-
-print(f"?? Metrics ? {METRIC_CSV}")
-print(classification_report(trues, preds, zero_division=0))
-'''
-
-# ---------------------------------------------------------------------
-# Save confusion matrix
-# ---------------------------------------------------------------------
-cm = confusion_matrix(trues, preds, labels=[0, 1, 2])
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-plt.xlabel("Predicted")
-plt.ylabel("True")
-plt.title("Confusion Matrix - ClinicalBERT+Transformer")
-plt.tight_layout()
-conf_matrix_path = f"{BASE}/clinicalbert_confusion_{METRIC_PREFIX}.png"
-plt.savefig(conf_matrix_path)
-plt.close()
-print(f"??? Confusion matrix saved ? {conf_matrix_path}")
-
-# ---------------------------------------------------------------------
-# Save probabilities for stacking
-# ---------------------------------------------------------------------
-npz_path = f"{BASE}/clinicalbert_transformer_probs_{METRIC_PREFIX}.npz"
-np.savez_compressed(
-    npz_path,
-    probs=probs_np,
-    y_true=y_val_np,
-    subject_ids=subj_out
-)
-print(f"?? Saved ClinicalBERT+Transformer probs ? {npz_path}")
-
-if probs_np.shape[0] == 0:
-    print("?? No validation samples were processed ? empty .npz file!")
-   
+del model; torch.cuda.empty_cache(); gc.collect()

@@ -1,4 +1,3 @@
-Does this work?
 """
 stacking_meta_learner.py
 Improved stacking meta-learner that evaluates multiple classifiers and selects the best based on cross-validated macro F1 score.
@@ -184,33 +183,41 @@ candidates = {
     "LogisticRegression": LogisticRegression(max_iter=1000, class_weight="balanced", random_state=SEED),
     "RandomForest": RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=SEED),
     "XGBoost": XGBClassifier(
-                            n_estimators=100,
-                            learning_rate=0.1,
-                            eval_metric="mlogloss",
-                            verbosity=0,
-                            use_label_encoder=False,
-                            objective="multi:softprob",
-                            num_class=num_classes,
-                            random_state=SEED
-                        ),
-    "LightGBM": LGBMClassifier(n_estimators=200, learning_rate=0.05, class_weight="balanced", random_state=SEED, verbosity=-1),
+        n_estimators=100,
+        learning_rate=0.1,
+        eval_metric="mlogloss",
+        verbosity=0,
+        use_label_encoder=False,
+        objective="multi:softprob",
+        num_class=num_classes,
+        random_state=SEED
+    ),
+    "LightGBM": LGBMClassifier(
+        n_estimators=200, learning_rate=0.05,
+        class_weight="balanced", random_state=SEED,
+        verbose=-1  # ✅ updated param
+    ),
     "CatBoost": CatBoostClassifier(verbose=0, random_seed=SEED),
-    "MLP": MLPClassifier(hidden_layer_sizes=(100,), max_iter=1000, random_state=SEED),  # Increased max_iter
+    "MLP": MLPClassifier(hidden_layer_sizes=(100,), max_iter=1000, random_state=SEED),
     "SVM": SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=SEED),
     "NaiveBayes": GaussianNB(),
     "StackingCV": StackingClassifier(
         estimators=[
             ('lr', LogisticRegression(max_iter=500, class_weight='balanced', random_state=SEED)),
             ('rf', RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=SEED)),
-            ('xgb', XGBClassifier(n_estimators=100, learning_rate=0.1, eval_metric="mlogloss", verbosity=0, use_label_encoder=False, objective="multi:softprob", num_class=num_classes, random_state=SEED))  # removed use_label_encoder
+            ('xgb', XGBClassifier(n_estimators=100, learning_rate=0.1, eval_metric="mlogloss",
+                                  verbosity=0, use_label_encoder=False,
+                                  objective="multi:softprob", num_class=num_classes,
+                                  random_state=SEED))
         ],
         final_estimator=LogisticRegression(max_iter=500, class_weight="balanced", random_state=SEED),
         cv=2
     )
 }
 
+best_model, best_score, best_fold_scores = None, -1, None
+candidate_scores = {}
 
-best_model, best_score = None, -1
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 print("Evaluating candidate meta-learners:")
 
@@ -219,25 +226,20 @@ for name, model in candidates.items():
     for train_idx, val_idx in cv.split(X_train_meta, y_train_meta):
         model.fit(X_train_meta[train_idx], y_train_meta[train_idx])
         raw_preds = model.predict(X_train_meta[val_idx])
-
-        # Handle classifiers that return probability vectors instead of class labels
-        if hasattr(raw_preds, "shape") and len(raw_preds.shape) == 2 and raw_preds.shape[1] > 1:
-            # Likely probability output; convert to predicted class
-            preds = np.argmax(raw_preds, axis=1)
-        else:
-            preds = raw_preds  # Already class labels
-
-        # Ensure y_true and preds are 1D and compatible
-        y_true_fold = y_train_meta[val_idx]
-        preds = np.array(preds).flatten()
-
-        score = f1_score(y_true_fold, preds, average="macro", zero_division=0)
+        preds = (np.argmax(raw_preds, axis=1)
+                 if hasattr(raw_preds, "shape") and raw_preds.ndim == 2 and raw_preds.shape[1] > 1
+                 else raw_preds)
+        score = f1_score(y_train_meta[val_idx], preds, average="macro", zero_division=0)
         fold_scores.append(score)
+
     avg_score = np.mean(fold_scores)
+    candidate_scores[name] = fold_scores  # ✅ store per-model scores
     print(f"{name}: macro-F1 = {avg_score:.4f}")
+
     if avg_score > best_score:
         best_score = avg_score
         best_model = (name, model)
+        best_fold_scores = fold_scores  # ✅ keep the fold scores for the best model
 
 print(f"\nBest meta-learner: {best_model[0]} (macro-F1 = {best_score:.4f})")
 
@@ -287,17 +289,25 @@ for cls, row in report.items():
 
 # Save all candidate scores
 X_meta_filtered, y_true_filtered = filter_rare_classes(X_meta, y_true, min_count=5)
+
+# ---------------------------------------------------------------------
+# Save all candidate scores (avg + per-fold)
+# ---------------------------------------------------------------------
 score_log_path = f"{BASE}/stacker_candidate_scores_{METRIC_PREFIX}.csv"
 with open(score_log_path, "w", newline="") as f:
     writer = csv.writer(f)
-    writer.writerow(["Model", "Macro-F1"])
-    for name, model in candidates.items():
-        model.fit(X_meta_filtered, y_true_filtered)
-        raw_preds = model.predict(X_meta_filtered)
-        preds = np.argmax(raw_preds, axis=1) if raw_preds.ndim == 2 and raw_preds.shape[1] > 1 else raw_preds
-        score = f1_score(y_true_filtered, preds, average="macro", zero_division=0)
-        writer.writerow([name, f"{score:.4f}"])
-print(f"Candidate scores saved → {score_log_path}")
+    # Header includes fold names dynamically
+    header = ["Model", "Avg_MacroF1"] + [f"Fold{i+1}" for i in range(cv.get_n_splits())]
+    writer.writerow(header)
+
+    for name, fold_scores in candidate_scores.items():
+        avg_score = np.mean(fold_scores)
+        row = [name, f"{avg_score:.4f}"] + [f"{s:.4f}" for s in fold_scores]
+        writer.writerow(row)
+
+print(f"📊 Candidate per-fold scores saved → {score_log_path}")
+mlflow.log_artifact(score_log_path)
+
 
 # ---------------------------------------------------------------------
 # 4. Confusion matrix
@@ -334,13 +344,19 @@ pd.DataFrame({
 print(f"📄 Predictions CSV saved → {pred_csv_path}")
 mlflow.log_artifact(pred_csv_path)
 
-# Save per-fold F1 scores
+# Save per-fold F1 scores (best model only)
 fold_scores_log_path = f"{BASE}/stacker_best_model_folds_{METRIC_PREFIX}.csv"
 with open(fold_scores_log_path, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["Fold", "Macro-F1"])
-    for i, score in enumerate(fold_scores):
+    for i, score in enumerate(best_fold_scores):   # ✅ use stored fold scores
         writer.writerow([f"Fold-{i+1}", f"{score:.4f}"])
+mlflow.log_artifact(fold_scores_log_path)
+
+# In model card writing:
+for i, score in enumerate(best_fold_scores):       # ✅ correct scores
+    f.write(f"  - Fold {i+1}: {score:.4f}\n")
+
 mlflow.log_artifact(fold_scores_log_path)
 
 # SHAP Analysis (for supported models only)
@@ -392,6 +408,7 @@ with open(f"{BASE}/stacker_meta_feature_names_{METRIC_PREFIX}.txt", "w") as f:
     for name in all_feature_names:
         f.write(name + "\n")
 mlflow.log_artifact(f"{BASE}/stacker_meta_feature_names_{METRIC_PREFIX}.txt")
+
 # ---------------------------------------------------------------------
 # 6. Additional SHAP Visualizations: Force and Waterfall for a sample
 # ---------------------------------------------------------------------
@@ -460,10 +477,15 @@ with open(model_card_path, "w") as f:
     f.write("## Performance Summary\n")
     f.write(f"- Accuracy: {acc:.4f}\n")
     f.write(f"- Macro F1-score: {best_score:.4f}\n")
-    f.write(f"- Per-fold F1 Scores:\n")
-    for i, score in enumerate(fold_scores):
+    f.write("- Per-fold F1 Scores (Best Model):\n")
+    for i, score in enumerate(best_fold_scores):
         f.write(f"  - Fold {i+1}: {score:.4f}\n")
     f.write("\n")
+
+    f.write("## Candidate Comparison (Avg Macro-F1)\n")
+    for name, fold_scores in candidate_scores.items():
+        f.write(f"- {name}: {np.mean(fold_scores):.4f}\n")
+
 
     f.write("## Interpretability Artifacts\n")
     if os.path.exists(shap_plot_path):
