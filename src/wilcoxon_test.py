@@ -2,11 +2,12 @@
 import pandas as pd
 from scipy.stats import wilcoxon
 import glob, sys, itertools
+from statsmodels.stats.multitest import multipletests
 
 # ---------------------------------------------------------------------
 # 1. Load all iteration summaries
 # ---------------------------------------------------------------------
-files = glob.glob("results_summary_iter*.csv")
+files = glob.glob("../analysis/results/results_clean/results_summary_macro_iter*.csv")
 if not files:
     print("❌ No results_summary_iter*.csv files found.")
     sys.exit(1)
@@ -100,11 +101,20 @@ if not results:
     print("⚠️ No valid model pairs found for Wilcoxon testing.")
     sys.exit(0)
 
+# After building results_df
 results_df = pd.DataFrame(results).sort_values("p_value")
-print("\n📊 Pairwise Wilcoxon Signed-Rank Tests")
-print("--------------------------------------------------")
-print(results_df.to_string(index=False))
+
+# Apply Holm–Bonferroni correction
+reject, p_adj, _, _ = multipletests(results_df["p_value"], method="holm")
+
+results_df["p_value_adj"] = p_adj
+results_df["significant_adj"] = reject
+
+print("\n📊 Pairwise Wilcoxon Signed-Rank Tests (Holm-adjusted)")
+print("----------------------------------------------------------")
+print(results_df[["model_1", "model_2", "n_pairs", "p_value", "p_value_adj", "significant_adj"]]
+      .to_string(index=False))
 
 # Save results
-results_df.to_csv("wilcoxon_results.csv", index=False)
-print("\n✅ Saved detailed results → wilcoxon_results.csv")
+results_df.to_csv("../analysis/results/wilcoxon_results.csv", index=False)
+print("\n✅ Saved adjusted results → wilcoxon_results.csv")
