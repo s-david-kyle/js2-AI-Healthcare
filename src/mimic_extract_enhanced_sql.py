@@ -11,9 +11,9 @@ load_dotenv()
 # ---------------------------------------------------------------------
 HOST = os.getenv("MIMIC_HOST", "localhost")
 DBNAME = os.getenv("MIMIC_DBNAME", "mimic")
-USER = os.getenv("MIMIC_USER", "gchism")
-PASSWORD = os.getenv("MIMIC_PASSWORD", "Chism1154")  # <-- set in .env in practice
-SCHEMA = os.getenv("MIMIC_SCHEMA", "mimiciii")
+USER = os.getenv("MIMIC_USER", "")
+PASSWORD = os.getenv("MIMIC_PASSWORD", "") 
+SCHEMA = os.getenv("MIMIC_SCHEMA", "")
 PORT = int(os.getenv("MIMIC_PORT", 5432))
 
 DATABASE_URL = f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DBNAME}"
