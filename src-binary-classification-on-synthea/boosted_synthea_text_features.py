@@ -22,7 +22,7 @@ load_dotenv()
 # ---------------------------------------------------------------------
 # 1. Load Medications Data
 # ---------------------------------------------------------------------
-medications_path = os.getenv("synthe_medications_path", "./synthea_data/medications.csv")
+medications_path = os.getenv("synthea_medications_path", "./synthea_data/medications.csv")
 medications_df = pd.read_csv(medications_path, low_memory=False)
 medications_df.columns = medications_df.columns.str.lower().str.strip()
 
